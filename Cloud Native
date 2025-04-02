@@ -1,0 +1,85 @@
+# Create separate service accounts
+
+gcloud iam service-accounts create deployer --display-name "CI/DC Service Account"
+
+gcloudud iam service-accounts create runtime-sa --display-name "Runtime Service Account"
+
+#Enable required APIs
+
+gcloud services enable \
+  compute.googleapis.com \
+  cloudbuild.googleapis.com \
+  secretmanager.googleapis.com
+
+resource "google_compute_instance_template" "blue_template" {
+  name_prefix = "blue-template-"
+  service_account {
+    email = google_service_account.runtime-sa.email
+    scopes = ["cloud-platform"]
+  }
+  metadata = {
+    color = "blue" # Injected as ENV variable
+  }
+}
+
+resource "google_compute_region_instance_group_manager" "blue_mig" {
+  name = "blue-mig"
+  version {
+    instance_template = google_compute_instance_template.blue_template.id
+  }
+  auto_healing_policies {
+    health_check = google_compute_health_check.default.id
+    initial_delay_sec = 300
+  }
+
+resource "google_compute_url_map" "default" {
+  default_service = google_compute_backend_service.default.id
+
+  host_rule {
+    hosts = ["*"]
+    path_matcher = "allpaths"
+  }
+
+  path_matcher {
+    name = "allpaths"
+    default_service = google_compute_backend_service.default.id
+  }
+}
+
+resource "google_compute_backend_service" "default" {
+  backend {
+    group = google_compute_region_instance_group_manager.blue_mig.instance_group
+    capacity_scaler = 0.5
+  }
+  backend {
+    group = google_compute_region_instance_group_manager.green_mig.instance_group
+    capacity_scaler = 0.5
+  }
+}
+
+steps:
+- name: 'gcr.io/cloud-builders/terraform'
+  entrypoint: 'bash'
+  args:
+  - '-c'
+  - |
+    terraform init -backend-config="bucket=$PROJECT_ID-tfstate"
+    terraform apply -auto-approve -var "deployment_color=blue"
+
+- name: 'gcr.io/cloud-builders/gcloud'
+  args: 
+    - compute
+    - instance-groups
+    - rolling-action
+    - start-update
+    - blue-mig
+    - --version=template=blue-template-latest
+
+- name: 'gcr.io/cloud-builders/gcloud'
+  args: 
+    - compute
+    - instance-groups
+    - rolling-action
+    - start-update
+    - green-mig
+    - --version=template=green-template-latest
